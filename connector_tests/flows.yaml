@@ -1,0 +1,238 @@
+# Flowcharts shown on the report's "Flow charts" tab, keyed by connector `type`.
+# Written in plain language for readers who don't know the code. Keep in sync with src/enterprise_connectors.
+#
+# Step fields (all optional except title):
+#   title    short name of the block
+#   kind     step | decision | harness | result
+#   does     what the block does, in everyday words
+#   input    what goes into it
+#   output   what comes out of it
+#   fails    list: what can go wrong -> what you see
+#   notes    list: other useful details (timeouts, retries, defaults)
+#   code     the call in the code, for developers
+#   stop     rules that place a test's badge here (first match in document order wins):
+#              {category: ...} | {reason: <regex on the reason>} | {success: true}
+# A stage has `title`, optional `summary`, and either `steps` or `branches` (side-by-side lanes).
+
+postgres:
+  title: PostgreSQL connection
+  start: "START: your program wants data from a PostgreSQL database"
+  end: "END: everything is closed, nothing is left open on the database"
+  summary: >-
+    This is the journey from "I want to talk to the database" to "I have a working connection", and how it is
+    handed back afterwards. Read it top to bottom. Each box says what happens, what goes in and what comes out.
+    Coloured badges show where each test in this report stopped, or "finished" if it went all the way.
+
+  stages:
+    - title: "0 · Test tool only (skipped in a real application)"
+      summary: The test harness gets ready. A real application starts at step 1.
+      steps:
+        - id: harness
+          kind: harness
+          title: Prepare the test
+          does: >-
+            The test tool reads its list of tests and looks up the values for every env:// reference (for example
+            the password) from the .env file or the environment.
+          input: "connectors_test.yaml (the list of tests) and .env (the real values)"
+          output: The settings for one test, with real values filled in. They stay in memory only and are never written out.
+          fails:
+            - "A variable such as EC_POSTGRES_PASSWORD is not set → result 'secret not resolved'"
+            - "The package cannot be found → result 'import error'"
+          code: run_connector_tests.py
+          stop:
+            - {category: "secret not resolved"}
+            - {category: "import error"}
+            - {category: "invalid test definition"}
+
+    - title: "1 · Read the settings and check them (instant: nothing is sent to the database yet)"
+      summary: >-
+        The package reads which database to use and checks the settings make sense. If something is wrong, you find
+        out immediately, before any connection attempt.
+      steps:
+        - id: connections_file
+          title: Read connections.yaml
+          does: >-
+            Reads your list of named databases (e.g. pipeline_db). Each entry is checked on its own. A broken
+            entry is put aside with the reason, and the other databases still load.
+          input: "connections.yaml, plus environment variables for any env:// values in the settings"
+          output: "One ready-to-use connector per valid name. Broken entries are listed in manager.load_errors."
+          fails:
+            - "An entry is wrong (missing field, password typed in plain text, unknown type) → that one is skipped; asking for it later gives the reason"
+          notes:
+            - "Optional: code can also pass settings directly with manager.create(...) instead of a YAML file."
+          code: 'manager = ConnectorManager.from_yaml("connections.yaml");  db = manager.get("pipeline_db")'
+          stop: [{reason: "is invalid and was not loaded"}]
+        - id: registry
+          title: Pick the PostgreSQL connector
+          does: 'Looks at "type: postgres" and selects the PostgreSQL connector. The database driver is not loaded yet.'
+          input: 'The type name, e.g. "postgres"'
+          output: The PostgreSQL connector, ready to be configured
+          fails: ["Unknown type (e.g. a typo like 'postgress') → ConfigurationError listing the valid types"]
+          code: ConnectorRegistry.get("postgres")
+          stop: [{reason: "Unknown connector type"}]
+        - id: config
+          title: Turn the settings into a settings object
+          does: >-
+            Takes host, port, database and the other settings and builds a fixed settings object. Unknown settings
+            are refused, and so is a password placed here (passwords belong in credentials).
+          input: "The config section: host, port, database, sslmode, connect_timeout …"
+          output: "A PostgresConfig object (defaults filled in, e.g. port 5432, connect_timeout 10s)"
+          fails: ["A required setting is missing (e.g. database) or a setting is misspelled → ConfigurationError"]
+          code: PostgresConfig.from_mapping(config)
+          stop: [{reason: "^factory raised ConfigurationError: (Invalid|Unknown) PostgresConfig"}]
+        - id: validate
+          kind: decision
+          title: Are the settings valid?
+          does: >-
+            Checks the values themselves: the host looks like a host name, the database name is not empty, the
+            port is between 1 and 65535 and the SSL mode is a real option.
+          input: The settings object from the previous box
+          output: "YES → the connector is ready (still not connected). NO → ConfigurationError saying what to fix."
+          fails: ["Bad value (e.g. port 0, host 'postgres://...') → ConfigurationError"]
+          code: connector.validate()
+          stop: [{reason: "^factory raised"}]
+
+    - title: "2 · Get the login details (only when a connection is first needed)"
+      summary: >-
+        The username and password are read at the last possible moment, so a changed password is picked up without a
+        restart, and secrets are not kept around longer than needed.
+      steps:
+        - id: authenticate
+          kind: decision
+          title: Read the username and password
+          does: >-
+            Reads the login details from where connections.yaml points: env:// from an environment variable,
+            awssm:// from AWS Secrets Manager. It then creates a private "pool key" from the database, the user
+            and the connection name, so different users or databases never share a connection.
+          input: "The credentials section of connections.yaml: the username comes from env://EC_POSTGRES_USER and the password from env://EC_POSTGRES_PASSWORD"
+          output: The username and password in memory (never printed or logged) and the pool key
+          fails:
+            - "The variable is not set → ConfigurationError naming the variable (never its value)"
+            - "The secret store cannot be read → AuthenticationError"
+            - "Login type not supported by PostgreSQL → UnsupportedOperation"
+          code: provider.get_credentials()
+          stop: [{reason: "connect raised (UnsupportedOperation|AuthenticationError: Could not obtain)"}, {reason: "environment variable .* is not set"}]
+
+    - title: "3 · Connect and use the connection"
+      summary: >-
+        There are two ways to get a connection. Left: a single one-off connection (what the test tool uses to prove
+        the login works). Right: borrowing from the pool, which is what your application should normally use.
+      branches:
+        - title: "A · One-off connection: db.connect()"
+          steps:
+            - id: driver
+              title: Load the PostgreSQL driver
+              does: Loads psycopg, the library that actually speaks to PostgreSQL. It is only loaded now, so it is optional to install.
+              input: Nothing
+              output: The driver, ready to use
+              fails: ['psycopg is not installed → ConfigurationError telling you to run pip install "enterprise-connectors[postgres]"']
+              code: import_driver("psycopg", extra="postgres")
+              stop: [{reason: "Optional dependency"}]
+            - id: native_connect
+              kind: decision
+              title: Log in to the database
+              does: >-
+                Opens a network connection to the server and logs in. If the server cannot be reached it tries
+                again (3 attempts, waiting 0.5s then 1s). A wrong password is not retried, because retrying won't help.
+              input: "host, port, database, username, password, connect_timeout (default 10s), SSL mode"
+              output: An open, logged-in connection
+              fails:
+                - "Wrong password or unknown user → AuthenticationError (or ConfigurationError if the user/database doesn't exist)"
+                - "User not allowed into this database → AuthorizationError"
+                - "No answer within connect_timeout → ConnectionTimeout"
+                - "Server unreachable (wrong host/port, server down, firewall) → ConnectionError"
+              notes:
+                - "Error messages never contain the password; the original driver error is summarised and cleaned."
+                - "If the login fails, the password is re-read once in case it was just changed."
+              code: psycopg.connect(host, port, dbname, user, password, connect_timeout, sslmode, application_name)
+              stop:
+                - {reason: "^no result after"}
+                - {reason: "^connect raised"}
+            - id: returned
+              kind: result
+              title: Hand back the connection
+              does: Gives your code the open connection. It is not part of the pool, so your code must close it when finished.
+              input: The open connection
+              output: "A psycopg.Connection: your code runs SQL with conn.execute(...)"
+              notes: ["Its session number (backend PID) is logged as connection_id."]
+              code: "conn = db.connect()   ...   conn.close()"
+              stop: [{category: "returned None"}, {category: "type mismatch"}]
+            - id: health
+              kind: harness
+              title: "Test check: ask the database 'SELECT 1'"
+              does: >-
+                The test tool sends the simplest possible query to prove the connection really answers, then records the
+                connection's details for the Connections tab.
+              input: The connection from the previous box
+              output: PASS or FAIL for this test, plus the connection's details (shown on the Connections tab)
+              fails: ["The query fails → result 'health check failed'"]
+              code: conn.execute("SELECT 1")
+              stop: [{category: "health check failed"}]
+        - title: "B · Borrow from the pool: with db.connection() as conn (recommended)"
+          steps:
+            - id: pool_acquire
+              title: Find this database's pool
+              does: >-
+                A pool is a small group of connections kept open and ready, so your code doesn't log in again for every
+                query. Each named connection has its own pool. Different users or databases never share one.
+              input: The pool key from step 2
+              output: The pool for this database (created the first time it is needed)
+              code: PoolManager.acquire(pool_key)
+            - id: checkout
+              kind: decision
+              title: Is a connection free?
+              does: >-
+                If an open connection is free, it is reused. If none is free and the pool is below its limit, a new one
+                is opened (using the same login steps as on the left). If the pool is full, your code waits for someone
+                to return one.
+              input: "Your request for a connection; the pool limits (max_size: default 5, pipeline_db uses 10)"
+              output: "A connection reserved only for you, with a lease_id that tags this one borrow in the logs"
+              fails:
+                - "All connections stayed busy longer than checkout_timeout (default 30s) → PoolTimeout"
+                - "Pool set to 'fail' instead of waiting → PoolExhausted immediately"
+              notes:
+                - "Connections older than 30 minutes, or unused for 10 minutes, are replaced with fresh ones."
+                - "The 'Pool connections' tab shows 10 users being served by 5 connections this way."
+              code: pool.checkout()
+              stop: [{category: "pool check failed"}]
+            - id: pool_health
+              title: Quick check if it hasn't been checked recently
+              does: >-
+                If the connection hasn't been checked in the last 30 seconds, it runs "SELECT 1" first. A dead
+                connection is thrown away and replaced automatically, and your code never sees it.
+              input: The reserved connection
+              output: A connection known to be working
+              code: SELECT 1 (only if not checked in the last 30s)
+            - id: lease
+              kind: result
+              title: Your code uses the connection
+              does: Inside the "with" block the connection is yours alone. Run as many queries as you need.
+              input: Your SQL and its values
+              output: Your data (rows), e.g. from .fetchall()
+              notes: ["Call conn.commit() if you changed data, or the change is undone on the way back."]
+              code: 'with db.connection() as conn:  rows = conn.execute("SELECT ...").fetchall()'
+            - id: reset
+              kind: decision
+              title: Clean up and put it back
+              does: >-
+                When the "with" block ends, the connection goes back to the pool. Unsaved changes are undone and settings
+                your code changed are put back to normal, so the next user gets a clean connection. A broken connection
+                is thrown away instead.
+              input: The connection your code has finished with
+              output: The connection back in the pool, ready for the next user (or discarded if it was broken)
+              code: automatic at the end of "with"
+
+    - title: "4 · Shut down"
+      summary: When the program ends, everything is closed politely.
+      steps:
+        - id: close
+          title: Close everything
+          does: >-
+            Closes all pooled connections and the pools themselves. Connections still borrowed get up to 10 seconds to
+            be returned first.
+          input: "manager.close() (the test tool always does this, even after a failure)"
+          output: Nothing left open on the database server
+          notes:
+            - "Every step above also sent an event (with connection_name, connection_id and lease_id) that your app can log."
+          code: manager.close()
+          stop: [{success: true}]

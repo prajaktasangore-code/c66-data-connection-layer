@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+!.env.example
+*.log
+*.db
+.vscode/
+.idea/
+
+# connector test harness output
+test_reports/
+
+# maintainer's local notes (CLAUDE.md, MIGRATION.md): delete the folder when the project is done
+.claude/

@@ -1,0 +1,136 @@
+# Connector connection tests. See README.md in this folder.
+#
+# Secrets are always env:// references, resolved from --env-file first, then the process environment.
+#   env://NAME                    required string
+#   env://NAME?type=int           cast (int | float | bool)
+#   env://NAME?default=5432       fallback when NAME is unset (never use for real secrets)
+
+defaults:
+  # module:callable. A segment ending in () is instantiated (no args) for each test and closed afterwards.
+  factory: "enterprise_connectors:ConnectorManager().create"
+  call_style: type_config_credentials    # type_and_config | dict | kwargs | type_config_credentials
+  credentials_class: "enterprise_connectors:UsernamePassword"   # builds the `credentials` block
+  connect_method: connect                # called on the factory's result; returns the native connection
+  health_check:                          # called on the native connection; must not raise or return False
+    method: execute
+    args: ["SELECT 1"]
+  close_method: close                    # closes the native connection
+  handle_close_method: close             # closes the connector returned by the factory
+  pool_probe:                            # optional: also exercise the pooled path once the raw connect worked
+    context_method: connection           # context manager on the connector; health_check runs inside each checkout
+    checkouts: 2                         # 2 shows whether the pool reuses the connection
+    stats: owner.pool_manager.stats      # owner. = object created by () in factory; handle. = the connector
+  event_hook: owner.add_hook             # optional: record SDK events (connections opened, checkouts, ...) per test
+  timeout_seconds: 20
+  capture_depth: 2                       # how deep to record object attributes (1 = top level only)
+  python_path: ["../src"]                # relative to this file; lets the SDK run without installing it
+
+# Test every connection the application will use, straight from its connections file. Each entry becomes a
+# test; an invalid entry is reported as FAIL with its reason and the other entries still run.
+connections_file:
+  path: ../connections.yaml
+  expect_by_type:
+    postgres: {object_type: "psycopg:Connection"}
+  # tests:                          # optional per-connection overrides
+  #   some_connection: {expect: {success: false, error_contains: "..."}}
+
+tests:
+  - name: postgres-primary
+    type: postgres
+    enabled: true
+    overrides:
+      # Simulated users asking for a pooled connection at the same moment, more users than the pool's
+      # max_size (5), so some must wait for a connection to be returned. Shown on the "Pool connections" tab.
+      concurrency_probe:
+        users: 10
+        hold_seconds: 0.3
+        context_method: connection
+        stats: owner.pool_manager.stats
+        identify:                        # runs inside each user's connection: which server session served it
+          method: execute
+          args: ["SELECT pg_backend_pid(), current_user, current_database(), (SELECT count(*) FROM pg_stat_activity WHERE application_name = current_setting('application_name'))"]
+          then: fetchone
+        columns: [backend_pid, db_user, database, server_sessions]
+        connection_key: backend_pid
+    config:
+      host: env://EC_POSTGRES_HOST
+      port: env://EC_POSTGRES_PORT?type=int&default=5432
+      database: env://EC_POSTGRES_DATABASE
+      connect_timeout: 10
+      retry: {max_attempts: 1}
+    credentials:
+      username: env://EC_POSTGRES_USER
+      password: env://EC_POSTGRES_PASSWORD
+    expect:
+      success: true
+      object_type: "psycopg:Connection"
+
+  # Negative: real server and password, but a user that does not exist.
+  # A password-checking server answers "password authentication failed" (AuthenticationError). A server using
+  # pg_hba "trust" answers 'role "..." does not exist' (ConfigurationError). A wrong *password* alone cannot
+  # fail against a trust server, which is why this test changes the user instead.
+  - name: postgres-bad-credentials
+    type: postgres
+    enabled: true
+    config:
+      host: env://EC_POSTGRES_HOST
+      port: env://EC_POSTGRES_PORT?type=int&default=5432
+      database: env://EC_POSTGRES_DATABASE
+      connect_timeout: 10
+      retry: {max_attempts: 1}
+    credentials:
+      username: c66_harness_no_such_user
+      password: env://EC_POSTGRES_PASSWORD
+    expect:
+      success: false
+      error_contains: ["AuthenticationError", "does not exist"]   # any of
+
+  # Negative: invalid configuration is rejected before any network call.
+  - name: postgres-missing-database
+    type: postgres
+    enabled: true
+    config:
+      host: env://EC_POSTGRES_HOST
+    credentials:
+      username: env://EC_POSTGRES_USER
+      password: env://EC_POSTGRES_PASSWORD
+    expect:
+      success: false
+      error_contains: "required keyword-only argument: 'database'"
+
+  # Negative: unroutable address. The harness must give up at timeout_seconds, not wait for the driver.
+  - name: postgres-unreachable-timeout
+    type: postgres
+    enabled: true
+    overrides:
+      timeout_seconds: 3
+    config:
+      host: 10.255.255.1
+      database: postgres
+      connect_timeout: 30
+      retry: {max_attempts: 1}
+    credentials:
+      username: nobody
+      password: env://EC_POSTGRES_PASSWORD
+    expect:
+      success: false
+      category: timeout
+
+# ---------------------------------------------------------------------------------------------
+# Examples for the other call styles (for connectors that take secrets inside the config).
+# `credentials` is merged into `config` for these styles.
+#
+#  - name: example-type-and-config          # factory(type, config)
+#    type: mysql
+#    overrides: {factory: "my_pkg.connectors:create", call_style: type_and_config, connect_method: null}
+#    config: {host: env://MYSQL_HOST, user: env://MYSQL_USER, password: env://MYSQL_PASSWORD}
+#
+#  - name: example-dict                     # factory({"type": ..., **config})
+#    type: s3
+#    overrides: {factory: "my_pkg.connectors:from_dict", call_style: dict}
+#    config: {bucket: my-bucket, aws_secret_access_key: env://AWS_SECRET_ACCESS_KEY}
+#
+#  - name: example-kwargs                   # factory(**config)
+#    overrides: {factory: "my_pkg.connectors:SnowflakeConnector", call_style: kwargs, connect_method: connect}
+#    config: {account: env://SNOWFLAKE_ACCOUNT, user: env://SNOWFLAKE_USER, password: env://SNOWFLAKE_PASSWORD}
+#    expect: {success: true, object_type: "snowflake.connector:SnowflakeConnection"}

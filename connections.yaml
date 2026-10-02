@@ -1,0 +1,39 @@
+# Named database connections for applications using enterprise_connectors.
+#
+#   manager = ConnectorManager.from_yaml("connections.yaml")
+#   with manager.get("pipeline_db").connection() as conn:   # native psycopg.Connection
+#       conn.execute("SELECT ...")
+#
+# Rules
+# - Secrets (password, key_password, token, ...) must be references, never plain values:
+#     env://NAME                      environment variable (e.g. from your .env)
+#     awssm://SECRET_ID#json_key      AWS Secrets Manager (needs the [aws] extra); ?region=eu-west-1 optional
+#   vault:// and akv:// are recognised but not supported yet.
+# - Non-secret config may use env://NAME too; values are converted to the field's type (e.g. port -> int).
+# - Each entry is checked on its own. An invalid entry is skipped and reported (manager.load_errors);
+#   the other connections still load. No connection is opened until first use.
+#
+# Entry keys: type, config, credentials, credentials_type (optional), pool (optional).
+# Postgres config: host, database, port (5432), sslmode (prefer), sslrootcert, application_name,
+#   connect_timeout (10s), tenant_id, options (extra non-secret libpq params), retry {max_attempts, ...}.
+# Pool: min_size (0), max_size (5), checkout_timeout (30s), max_lifetime (1800s), idle_timeout (600s),
+#   health_check_interval (30s), on_exhausted (wait | fail), shutdown_timeout (10s).
+
+maintenance_interval: 30          # seconds; background health checks, stale-connection recycling, min_size top-up
+
+connections:
+  pipeline_db:
+    type: postgres
+    config:
+      host: env://EC_POSTGRES_HOST
+      port: env://EC_POSTGRES_PORT
+      database: env://EC_POSTGRES_DATABASE
+      connect_timeout: 10
+      application_name: c66-integration-layer
+    credentials:
+      username: env://EC_POSTGRES_USER
+      password: env://EC_POSTGRES_PASSWORD
+    pool:
+      min_size: 1                 # keep one connection open and warm while the app runs
+      max_size: 10
+      checkout_timeout: 15
